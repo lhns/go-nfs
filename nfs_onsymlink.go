@@ -50,6 +50,9 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 
 	err = fs.Symlink(string(target), newFilePath)
 	if err != nil {
+		if isInvalid(err) {
+			return &NFSStatusError{NFSStatusInval, err}
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 

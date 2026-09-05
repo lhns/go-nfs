@@ -11,6 +11,15 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
+// isInvalid reports whether a filesystem error is EINVAL, which onCreate,
+// onMkdir, onSymlink and onRename map to NFSStatusInval. A backend that cannot
+// spell a name (a Windows host given a reserved or unencodable filename)
+// returns a *fs.PathError wrapping syscall.EINVAL; reporting that as ACCES or
+// IO sends the client hunting for a permission or disk fault that is not there.
+func isInvalid(err error) bool {
+	return errors.Is(err, syscall.EINVAL)
+}
+
 // dirNotEmpty reports whether err (from a failed Remove or Rename of path)
 // means the target is a non-empty directory. Native rename(2)/rmdir(2) and a
 // Linux bind mount return ENOTEMPTY here; go-nfs used to map every such failure

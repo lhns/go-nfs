@@ -79,6 +79,9 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	file, err := fs.Create(newFilePath)
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)
+		if isInvalid(err) {
+			return &NFSStatusError{NFSStatusInval, err}
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 	if err := file.Close(); err != nil {

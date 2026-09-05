@@ -113,6 +113,9 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsPermission(err) {
 			return &NFSStatusError{NFSStatusAccess, err}
 		}
+		if isInvalid(err) {
+			return &NFSStatusError{NFSStatusInval, err}
+		}
 		if dirNotEmpty(fs, toLoc, err) {
 			return &NFSStatusError{NFSStatusNotEmpty, err}
 		}
