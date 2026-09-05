@@ -3,11 +3,30 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
+
+// dirNotEmpty reports whether err (from a failed Remove or Rename of path)
+// means the target is a non-empty directory. Native rename(2)/rmdir(2) and a
+// Linux bind mount return ENOTEMPTY here; go-nfs used to map every such failure
+// to NFSStatusIO. Some billy backends (memfs) return a plain error rather than
+// syscall.ENOTEMPTY, so fall back to inspecting the target directly.
+func dirNotEmpty(fs billy.Filesystem, path string, err error) bool {
+	if errors.Is(err, syscall.ENOTEMPTY) {
+		return true
+	}
+	info, serr := fs.Lstat(path)
+	if serr != nil || !info.IsDir() {
+		return false
+	}
+	children, rerr := fs.ReadDir(path)
+	return rerr == nil && len(children) > 0
+}
 
 func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = wccDataErrorFormatter
@@ -54,6 +73,9 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 		}
 		if os.IsPermission(err) {
 			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		if dirNotEmpty(fs, toDelete, err) {
+			return &NFSStatusError{NFSStatusNotEmpty, err}
 		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}

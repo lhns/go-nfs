@@ -228,6 +228,10 @@ var (
 	opAttrErrorFormatter  = errFormatterWithBody(opAttrErrorBody[:])
 	wccDataErrorBody      = [8]byte{}
 	wccDataErrorFormatter = errFormatterWithBody(wccDataErrorBody[:])
+	// LINK3resfail is post_op_attr (file) + wcc_data (linkdir): 4 + 8 bytes,
+	// each an all-false "attributes/cache do not follow".
+	linkErrorBody      = [12]byte{}
+	linkErrorFormatter = errFormatterWithBody(linkErrorBody[:])
 )
 
 // statusFromWriteError maps write errors to NFS status codes

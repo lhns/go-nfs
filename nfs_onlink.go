@@ -4,66 +4,83 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"reflect"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
-// Backing billy.FS doesn't support hard links
+// onLink implements the NFSv3 LINK procedure (hard link).
+//
+// RFC 1813 LINK3args is
+//
+//	struct LINK3args {
+//	    nfs_fh3     file;   // existing object to link to
+//	    diropargs3  link;   // { directory handle, new name }
+//	};
+//
+// The previous implementation parsed it as SYMLINK3args (diropargs3 + sattr3 +
+// string), so a real hard-link request from the kernel died in the XDR parser
+// with EINVAL before any filesystem call was made.
 func onLink(ctx context.Context, w *response, userHandle Handler) error {
-	w.errorFmt = wccDataErrorFormatter
-	obj := DirOpArg{}
-	err := xdr.Read(w.req.Body, &obj)
+	w.errorFmt = linkErrorFormatter
+
+	// file: nfs_fh3 of the existing object.
+	fileHandle, err := xdr.ReadOpaque(w.req.Body)
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	attrs, err := ReadSetFileAttributes(w.req.Body)
-	if err != nil {
+	// link: diropargs3 naming where the new link is created.
+	link := DirOpArg{}
+	if err := xdr.Read(w.req.Body, &link); err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	target, err := xdr.ReadOpaque(w.req.Body)
-	if err != nil {
-		return &NFSStatusError{NFSStatusInval, err}
-	}
-
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	fs, existingPath, err := userHandle.FromHandle(fileHandle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
+	dirFs, dirPath, err := userHandle.FromHandle(link.Handle)
+	if err != nil {
+		return &NFSStatusError{NFSStatusStale, err}
+	}
+	// A hard link cannot cross filesystems.
+	if !reflect.DeepEqual(fs, dirFs) {
+		return &NFSStatusError{NFSStatusXDev, os.ErrInvalid}
+	}
+
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
 
-	if len(string(obj.Filename)) > PathNameMax {
+	if len(string(link.Filename)) > PathNameMax {
 		return &NFSStatusError{NFSStatusNameTooLong, os.ErrInvalid}
 	}
 
-	newFilePath := fs.Join(append(path, string(obj.Filename))...)
+	newFilePath := fs.Join(append(dirPath, string(link.Filename))...)
 	if _, err := fs.Stat(newFilePath); err == nil {
 		return &NFSStatusError{NFSStatusExist, os.ErrExist}
 	}
-	if s, err := fs.Stat(fs.Join(path...)); err != nil {
+	if s, err := fs.Stat(fs.Join(dirPath...)); err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
 	} else if !s.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
 
-	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
+	// billy's base Filesystem has no hard-link operation; only a Change that
+	// also implements UnixChange can create one. Report the honest "server does
+	// not support this" rather than letting it fall through to ACCES.
 	changer := userHandle.Change(fs)
-	if changer == nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	cos, ok := changer.(UnixChange)
+	linker, ok := changer.(UnixChange)
 	if !ok {
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
 	}
 
-	err = cos.Link(string(target), newFilePath)
-	if err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
+	existingFilePath := fs.Join(existingPath...)
+	if err := linker.Link(existingFilePath, newFilePath); err != nil {
+		if os.IsPermission(err) {
+			return &NFSStatusError{NFSStatusAccess, err}
+		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
@@ -71,19 +88,11 @@ func onLink(ctx context.Context, w *response, userHandle Handler) error {
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-
-	// "handle follows"
-	if err := xdr.Write(writer, uint32(1)); err != nil {
+	// LINK3resok { post_op_attr file_attributes; wcc_data linkdir_wcc; }
+	if err := WritePostOpAttrs(writer, tryStat(fs, existingPath)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, fp); err != nil {
-		return &NFSStatusError{NFSStatusServerFault, err}
-	}
-	if err := WritePostOpAttrs(writer, tryStat(fs, append(path, string(obj.Filename)))); err != nil {
-		return &NFSStatusError{NFSStatusServerFault, err}
-	}
-
-	if err := WriteWcc(writer, nil, tryStat(fs, path)); err != nil {
+	if err := WriteWcc(writer, nil, tryStat(fs, dirPath)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 

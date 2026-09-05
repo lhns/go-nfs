@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"io/fs"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 
 	"github.com/willscott/go-nfs"
@@ -140,6 +142,63 @@ func (c *CachingHandler) appendReverseHandle(path string, id uuid.UUID) {
 	c.reverseHandlesMu.Lock()
 	defer c.reverseHandlesMu.Unlock()
 	c.reverseHandles[path] = append(c.reverseHandles[path], id)
+}
+
+// Rename re-points the cached handle for source (and any handle below it, so a
+// file held open inside a renamed directory survives) at dest instead of
+// invalidating it. Keying handles by path means a plain invalidation on rename
+// hands the client ESTALE for a file it still has open, where a native mount
+// keeps the descriptor valid; moving the entry keeps the existing handle live
+// under its new path. See nfs_onrename.go.
+func (c *CachingHandler) Rename(sourceFs billy.Filesystem, source []string, destFs billy.Filesystem, dest []string) error {
+	sourceJoin := sourceFs.Join(source...)
+	prefix := sourceJoin + string(filepath.Separator)
+
+	c.reverseHandlesMu.Lock()
+	defer c.reverseHandlesMu.Unlock()
+
+	// Collect first: mutating reverseHandles while ranging it (and adding new
+	// keys) would leave which entries are visited undefined.
+	type move struct {
+		oldKey  string
+		newKey  string
+		newPath []string
+		ids     []uuid.UUID
+	}
+	var moves []move
+	for path, ids := range c.reverseHandles {
+		var rel []string
+		switch {
+		case path == sourceJoin:
+			rel = nil
+		case strings.HasPrefix(path, prefix):
+			rel = strings.Split(strings.TrimPrefix(path, prefix), string(filepath.Separator))
+		default:
+			continue
+		}
+		newPath := append(append([]string{}, dest...), rel...)
+		moves = append(moves, move{
+			oldKey:  path,
+			newKey:  destFs.Join(newPath...),
+			newPath: newPath,
+			ids:     ids,
+		})
+	}
+
+	for _, m := range moves {
+		delete(c.reverseHandles, m.oldKey)
+		for _, id := range m.ids {
+			e, ok := c.activeHandles.Peek(id)
+			if !ok {
+				continue
+			}
+			e.f = destFs
+			e.p = append([]string{}, m.newPath...)
+			c.activeHandles.Add(id, e)
+			c.reverseHandles[m.newKey] = append(c.reverseHandles[m.newKey], id)
+		}
+	}
+	return nil
 }
 
 func (c *CachingHandler) InvalidateHandle(fs billy.Filesystem, handle []byte) error {

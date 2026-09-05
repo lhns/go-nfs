@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"reflect"
 
@@ -11,6 +12,14 @@ import (
 )
 
 var doubleWccErrorBody = [16]byte{}
+
+// renameHandleMover is the optional interface a Handler implements to re-point a
+// cached handle at its new path on rename rather than invalidating it, so a
+// client that renames a file it holds open does not get ESTALE. Satisfied by
+// helpers.CachingHandler.
+type renameHandleMover interface {
+	Rename(sourceFs billy.Filesystem, source []string, destFs billy.Filesystem, dest []string) error
+}
 
 func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = errFormatterWithBody(doubleWccErrorBody[:])
@@ -71,10 +80,30 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	preDestData := ToFileAttribute(toDirInfo, toDirPath).AsCache()
 
-	oldHandle := userHandle.ToHandle(fs, append(fromPath, string(from.Filename)))
+	sourcePath := append(append([]string{}, fromPath...), string(from.Filename))
+	destPath := append(append([]string{}, toPath...), string(to.Filename))
+	oldHandle := userHandle.ToHandle(fs, sourcePath)
 
-	fromLoc := fs.Join(append(fromPath, string(from.Filename))...)
-	toLoc := fs.Join(append(toPath, string(to.Filename))...)
+	fromLoc := fs.Join(sourcePath...)
+	toLoc := fs.Join(destPath...)
+
+	// rename(2) replaces an existing empty directory atomically, but some billy
+	// backends (osfs.BoundOS) refuse a rename onto an existing target. Emulate
+	// the native behaviour when both sides are directories: reject a non-empty
+	// target with NFSStatusNotEmpty (what native and a Linux bind mount return,
+	// not NFSStatusIO), and clear an empty one first so a backend that would
+	// otherwise refuse still succeeds.
+	if toInfo, terr := fs.Lstat(toLoc); terr == nil && toInfo.IsDir() {
+		fromInfo, ferr := fs.Lstat(fromLoc)
+		if children, rerr := fs.ReadDir(toLoc); rerr == nil && len(children) > 0 {
+			return &NFSStatusError{NFSStatusNotEmpty, os.ErrExist}
+		}
+		if ferr == nil && fromInfo.IsDir() {
+			if err := fs.Remove(toLoc); err != nil {
+				return &NFSStatusError{NFSStatusIO, err}
+			}
+		}
+	}
 
 	err = fs.Rename(fromLoc, toLoc)
 	if err != nil {
@@ -84,10 +113,25 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsPermission(err) {
 			return &NFSStatusError{NFSStatusAccess, err}
 		}
+		if dirNotEmpty(fs, toLoc, err) {
+			return &NFSStatusError{NFSStatusNotEmpty, err}
+		}
+		// A backend that refuses to replace an existing target (rather than one
+		// that could not, above) reports it here; surface EEXIST, not EIO.
+		if errors.Is(err, os.ErrExist) {
+			return &NFSStatusError{NFSStatusExist, err}
+		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
-	if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {
+	// Move the cached handle to the new path instead of invalidating it, so a
+	// file (or a file open inside a renamed directory) stays reachable through
+	// the handle the client already holds.
+	if mover, ok := userHandle.(renameHandleMover); ok {
+		if err := mover.Rename(fs, sourcePath, fs, destPath); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+	} else if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
