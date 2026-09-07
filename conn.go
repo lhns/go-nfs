@@ -9,11 +9,16 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
+
+// maxBufferedRequestBytes is the largest request read into memory before it is
+// dispatched to a worker. See readRequestHeader.
+const maxBufferedRequestBytes = 2 << 20
 
 var (
 	// ErrInputInvalid is returned when input cannot be parsed
@@ -42,11 +47,26 @@ type conn struct {
 	net.Conn
 }
 
+// serve reads requests off one connection and hands each to a worker.
+//
+// A client multiplexes every outstanding RPC for a mount onto one connection,
+// so handling them one at a time makes the slowest operation the latency of
+// everything queued behind it. Replies therefore complete out of order, which
+// the protocol allows: a reply is matched to its call by XID.
 func (c *conn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	var wg sync.WaitGroup
+	defer func() {
+		// Cancel before waiting. A worker parked in finish() is released by the
+		// context, so waiting first would deadlock against it once
+		// serializeWrites has stopped draining.
+		cancel()
+		wg.Wait()
+	}()
 	c.writeSerializer = make(chan []byte, 1)
 	go c.serializeWrites(connCtx)
+
+	sem := make(chan struct{}, c.Server.maxConcurrentRequests())
 
 	bio := bufio.NewReader(c.Conn)
 	for {
@@ -60,20 +80,59 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		Log.Tracef("request: %v", w.req)
-		err = c.handle(connCtx, w)
-		respErr := w.finish(connCtx)
-		if err != nil {
-			Log.Errorf("error handling req: %v", err)
-			// failure to handle at a level needing to close the connection.
-			c.Close()
+
+		select {
+		case sem <- struct{}{}:
+		case <-connCtx.Done():
 			return
 		}
-		if respErr != nil {
-			Log.Errorf("error sending response: %v", respErr)
-			c.Close()
-			return
+
+		if !w.buffered {
+			// Arguments too large to buffer are still a reader over the
+			// connection, so this must run before anything else reads it.
+			ok := c.dispatch(connCtx, cancel, w)
+			<-sem
+			if !ok {
+				return
+			}
+			continue
 		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			c.dispatch(connCtx, cancel, w)
+		}()
 	}
+}
+
+// dispatch handles one request and queues its reply, reporting whether the
+// connection may carry more.
+//
+// A failure ends the connection under whatever else is in flight. That is what
+// a serial server did too, since a handler or response error closed the
+// connection and dropped every request queued behind it; the only difference
+// is that the dropped requests have now already started. Their replies are
+// never written, so the client sees them time out and retries them on the next
+// connection, exactly as it would have.
+func (c *conn) dispatch(ctx context.Context, cancel context.CancelFunc, w *response) bool {
+	err := c.handle(ctx, w)
+	respErr := w.finish(ctx)
+	if err != nil {
+		Log.Errorf("error handling req: %v", err)
+		// failure to handle at a level needing to close the connection.
+		c.Close()
+		cancel()
+		return false
+	}
+	if respErr != nil {
+		Log.Errorf("error sending response: %v", respErr)
+		c.Close()
+		cancel()
+		return false
+	}
+	return true
 }
 
 func (c *conn) serializeWrites(ctx context.Context) {
@@ -186,6 +245,9 @@ type response struct {
 	err       error
 	errorFmt  func(error) RPCError
 	req       *request
+	// buffered reports whether req.Body reads from memory rather than from the
+	// connection, which is what makes the request safe to hand to a worker.
+	buffered bool
 }
 
 func (w *response) writeXdrHeader() error {
@@ -294,7 +356,26 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, ErrInputInvalid
 	}
 
-	r := io.LimitedReader{R: reader, N: int64(reqLen)}
+	// The body is read in full before the handler sees it. Handlers parse
+	// their arguments lazily out of req.Body, so a body left as a reader over
+	// the connection can only be handled while nothing else reads that
+	// connection, which is what made a connection serial.
+	//
+	// FSINFO advertises a 1 GiB wtmax and a client may take it, so the cap is
+	// what keeps memory held by in-flight requests at maxConcurrentRequests
+	// times maxBufferedRequestBytes rather than times wtmax. A request over
+	// the cap keeps the old streaming body and is handled inline; Linux
+	// negotiates a wsize of at most 1 MiB, so this is the exotic case.
+	var body io.Reader = reader
+	buffered := reqLen <= maxBufferedRequestBytes
+	if buffered {
+		buf := make([]byte, reqLen)
+		if _, err := io.ReadFull(reader, buf); err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(buf)
+	}
+	r := io.LimitedReader{R: body, N: int64(reqLen)}
 
 	xid, err := xdr.ReadUint32(&r)
 	if err != nil {
@@ -322,7 +403,8 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		req:      &req,
 		errorFmt: basicErrorFormatter,
 		// TODO: use a pool for these.
-		writer: bytes.NewBuffer([]byte{}),
+		writer:   bytes.NewBuffer([]byte{}),
+		buffered: buffered,
 	}
 	return w, nil
 }

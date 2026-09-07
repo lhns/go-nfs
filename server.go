@@ -14,6 +14,28 @@ type Server struct {
 	Handler
 	ID [8]byte
 	context.Context
+
+	// MaxConcurrentRequests bounds how many requests one connection may have
+	// in flight at once. Zero means DefaultMaxConcurrentRequests.
+	//
+	// Bounded rather than a goroutine per request because each request in
+	// flight holds its whole argument list in memory, and a WRITE carries up
+	// to wsize of payload (a Linux mount negotiates 1 MiB). An unbounded
+	// server would let one client turn a burst of writes into that much
+	// resident memory per request, and would let one connection's backlog
+	// crowd out every other connection's work.
+	MaxConcurrentRequests int
+}
+
+// DefaultMaxConcurrentRequests is the per-connection request concurrency used
+// when Server.MaxConcurrentRequests is zero.
+const DefaultMaxConcurrentRequests = 8
+
+func (s *Server) maxConcurrentRequests() int {
+	if s.MaxConcurrentRequests > 0 {
+		return s.MaxConcurrentRequests
+	}
+	return DefaultMaxConcurrentRequests
 }
 
 // RegisterMessageHandler registers a handler for a specific

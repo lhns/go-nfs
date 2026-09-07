@@ -55,10 +55,18 @@ type entry struct {
 // ToHandle takes a file and represents it with an opaque handle to reference it.
 // In stateless nfs (when it's serving a unix fs) this can be the device + inode
 // but we can generalize with a stateful local cache of handed out IDs.
+//
+// The search and the mint are one critical section. Requests on one connection
+// are handled concurrently, so two LOOKUPs of one path that both missed would
+// otherwise mint a handle each and hand the client two handles for one file,
+// which a client is entitled to treat as two objects.
 func (c *CachingHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 	joinedPath := f.Join(path...)
 
-	if handle := c.searchReverseCache(f, joinedPath); handle != nil {
+	c.reverseHandlesMu.Lock()
+	defer c.reverseHandlesMu.Unlock()
+
+	if handle := c.searchReverseCacheLocked(f, joinedPath); handle != nil {
 		return handle
 	}
 
@@ -70,10 +78,10 @@ func (c *CachingHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 	evictedKey, evictedPath, ok := c.activeHandles.GetOldest()
 	if evicted := c.activeHandles.Add(id, entry{f, newPath}); evicted && ok {
 		rk := evictedPath.f.Join(evictedPath.p...)
-		c.evictReverseCache(rk, evictedKey)
+		c.evictReverseCacheLocked(rk, evictedKey)
 	}
 
-	c.appendReverseHandle(joinedPath, id)
+	c.reverseHandles[joinedPath] = append(c.reverseHandles[joinedPath], id)
 	b, _ := id.MarshalBinary()
 
 	return b
@@ -116,8 +124,10 @@ func (c *CachingHandler) refreshAncestors(f entry) {
 	}
 }
 
-func (c *CachingHandler) searchReverseCache(f billy.Filesystem, path string) []byte {
-	uuids := c.getReverseHandles(path)
+// searchReverseCacheLocked requires reverseHandlesMu. The LRU has a lock of
+// its own and never reaches back into this one, so taking it here is safe.
+func (c *CachingHandler) searchReverseCacheLocked(f billy.Filesystem, path string) []byte {
+	uuids := c.reverseHandles[path]
 
 	for _, id := range uuids {
 		if candidate, ok := c.activeHandles.Get(id); ok {
@@ -133,7 +143,11 @@ func (c *CachingHandler) searchReverseCache(f billy.Filesystem, path string) []b
 func (c *CachingHandler) evictReverseCache(path string, handle uuid.UUID) {
 	c.reverseHandlesMu.Lock()
 	defer c.reverseHandlesMu.Unlock()
+	c.evictReverseCacheLocked(path, handle)
+}
 
+// evictReverseCacheLocked requires reverseHandlesMu.
+func (c *CachingHandler) evictReverseCacheLocked(path string, handle uuid.UUID) {
 	uuids, ok := c.reverseHandles[path]
 	if !ok {
 		return
@@ -150,12 +164,6 @@ func (c *CachingHandler) getReverseHandles(path string) []uuid.UUID {
 	c.reverseHandlesMu.RLock()
 	defer c.reverseHandlesMu.RUnlock()
 	return c.reverseHandles[path]
-}
-
-func (c *CachingHandler) appendReverseHandle(path string, id uuid.UUID) {
-	c.reverseHandlesMu.Lock()
-	defer c.reverseHandlesMu.Unlock()
-	c.reverseHandles[path] = append(c.reverseHandles[path], id)
 }
 
 // Rename re-points the cached handle for source (and any handle below it, so a
