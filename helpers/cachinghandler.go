@@ -109,8 +109,21 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 // cache walking for one 256MB write, which is enough to push the RPCs queued
 // behind it past a soft mount's timeout and turn the write into EIO.
 func (c *CachingHandler) refreshAncestors(f entry) {
+	// Read under the index's own lock rather than through a slice handed out
+	// and then ranged: evictReverseCache shifts a key's slice IN PLACE, so a
+	// concurrent invalidation writes into the array being walked. A torn uuid
+	// resolves to nothing, so the ancestor it named is not refreshed, which is
+	// the eviction this loop exists to prevent. It needs two ids under one
+	// key, which "" -- every filesystem's root, walked by every request -- has
+	// as soon as more than one is mounted.
+	//
+	// Taking the LRU's lock under this one is the order ToHandle and Rename
+	// already use, and the LRU never reaches back into the index.
+	c.reverseHandlesMu.RLock()
+	defer c.reverseHandlesMu.RUnlock()
+
 	for i := len(f.p) - 1; i >= 0; i-- {
-		for _, id := range c.getReverseHandles(f.f.Join(f.p[:i]...)) {
+		for _, id := range c.reverseHandles[f.f.Join(f.p[:i]...)] {
 			_, _ = c.activeHandles.Get(id)
 		}
 	}
