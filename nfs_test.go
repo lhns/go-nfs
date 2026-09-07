@@ -3,6 +3,7 @@ package nfs_test
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -93,11 +94,20 @@ func (f *trackingFile) Close() error {
 	return f.File.Close()
 }
 
-func TestNFS(t *testing.T) {
+// TestMain sets go-nfs-client's debug logging once, before any client
+// exists. That logger is a package global with no synchronisation, and the
+// rpc client's receive goroutine reads it for as long as its connection is
+// open. Setting it inside a test therefore races with a goroutine an earlier
+// test left running, which -race reports on every branch of this repository.
+func TestMain(m *testing.M) {
+	flag.Parse()
 	if testing.Verbose() {
 		util.DefaultLogger.SetDebug(true)
 	}
+	os.Exit(m.Run())
+}
 
+func TestNFS(t *testing.T) {
 	// make an empty in-memory server.
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -441,10 +451,6 @@ func nfsRead(target *nfsc.Target, filePath string, offset uint64, count uint32) 
 }
 
 func TestReadEOF(t *testing.T) {
-	if testing.Verbose() {
-		util.DefaultLogger.SetDebug(true)
-	}
-
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatal(err)
