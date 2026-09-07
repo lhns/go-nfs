@@ -116,9 +116,17 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 // 10.3ms with 50,000, linear in the cache size. That is 1.9 seconds of pure
 // cache walking for one 256MB write, which is enough to push the RPCs queued
 // behind it past a soft mount's timeout and turn the write into EIO.
+//
+// The index is read under its own lock rather than through a snapshot:
+// evictReverseCacheLocked shifts a key's slice IN PLACE, so a range over one
+// handed out earlier races it. Taking the LRU's lock under this one is the
+// order ToHandle and Rename already use, and the LRU never reaches back.
 func (c *CachingHandler) refreshAncestors(f entry) {
+	c.reverseHandlesMu.RLock()
+	defer c.reverseHandlesMu.RUnlock()
+
 	for i := len(f.p) - 1; i >= 0; i-- {
-		for _, id := range c.getReverseHandles(f.f.Join(f.p[:i]...)) {
+		for _, id := range c.reverseHandles[f.f.Join(f.p[:i]...)] {
 			_, _ = c.activeHandles.Get(id)
 		}
 	}
@@ -158,12 +166,6 @@ func (c *CachingHandler) evictReverseCacheLocked(path string, handle uuid.UUID) 
 			return
 		}
 	}
-}
-
-func (c *CachingHandler) getReverseHandles(path string) []uuid.UUID {
-	c.reverseHandlesMu.RLock()
-	defer c.reverseHandlesMu.RUnlock()
-	return c.reverseHandles[path]
 }
 
 // Rename re-points the cached handle for source (and any handle below it, so a
