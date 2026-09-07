@@ -200,10 +200,21 @@ func TestConcurrencyIsBounded(t *testing.T) {
 
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(fs.release) }) }
+	// The in-flight lookups must finish before cleanup closes the client.
+	// go-nfs-client's Client.Close closes the channel its own receive
+	// goroutine delivers replies on, so closing it with a call outstanding is
+	// a close/send race inside that library. Deferred before release so the
+	// order on the way out is release, wait, cleanup.
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
 	defer release()
 
 	for i := 0; i < bound+1; i++ {
-		go func() { _, _ = lookupRaw(target, rootFH, "slow") }()
+		inflight.Add(1)
+		go func() {
+			defer inflight.Done()
+			_, _ = lookupRaw(target, rootFH, "slow")
+		}()
 	}
 
 	// The bound must hold for as long as the requests keep arriving.
