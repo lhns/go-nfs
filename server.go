@@ -18,12 +18,9 @@ type Server struct {
 	// MaxConcurrentRequests bounds how many requests one connection may have
 	// in flight at once. Zero means DefaultMaxConcurrentRequests.
 	//
-	// Bounded rather than a goroutine per request because each request in
-	// flight holds its whole argument list in memory, and a WRITE carries up
-	// to wsize of payload (a Linux mount negotiates 1 MiB). An unbounded
-	// server would let one client turn a burst of writes into that much
-	// resident memory per request, and would let one connection's backlog
-	// crowd out every other connection's work.
+	// Bounded rather than a goroutine per request: each request in flight holds
+	// its whole argument list in memory, up to maxBufferedRequestBytes, and one
+	// connection's backlog would otherwise crowd out every other connection.
 	MaxConcurrentRequests int
 }
 

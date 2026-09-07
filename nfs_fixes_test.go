@@ -18,14 +18,23 @@ import (
 // and returns a mounted client target plus a cleanup function.
 func startMemNFS(t *testing.T, fs billy.Filesystem) (*nfsc.Target, func()) {
 	t.Helper()
+	return startMemNFSBounded(t, fs, 0)
+}
+
+// startMemNFSBounded is startMemNFS with Server.MaxConcurrentRequests set.
+// Zero leaves the server's default.
+func startMemNFSBounded(t *testing.T, fs billy.Filesystem, maxConcurrent int) (*nfsc.Target, func()) {
+	t.Helper()
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := helpers.NewNullAuthHandler(fs)
-	cacheHelper := helpers.NewCachingHandler(handler, 1024)
+	srv := &nfs.Server{
+		Handler:               helpers.NewCachingHandler(helpers.NewNullAuthHandler(fs), 1024),
+		MaxConcurrentRequests: maxConcurrent,
+	}
 	go func() {
-		_ = nfs.Serve(listener, cacheHelper)
+		_ = srv.Serve(listener)
 	}()
 
 	c, err := rpc.DialTCP(listener.Addr().Network(), listener.Addr().(*net.TCPAddr).String(), false)

@@ -2,7 +2,6 @@ package nfs_test
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"path"
 	"sync"
@@ -12,47 +11,12 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	nfs "github.com/willscott/go-nfs"
-	"github.com/willscott/go-nfs/helpers"
 	"github.com/willscott/go-nfs/helpers/memfs"
 
 	nfsc "github.com/willscott/go-nfs-client/nfs"
 	rpc "github.com/willscott/go-nfs-client/nfs/rpc"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
-
-// startMemNFSWithServer is startMemNFS with the Server built here, so a test
-// can set a field on it before it serves.
-func startMemNFSWithServer(t *testing.T, fs billy.Filesystem, configure func(*nfs.Server)) (*nfsc.Target, func()) {
-	t.Helper()
-	listener, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := &nfs.Server{Handler: helpers.NewCachingHandler(helpers.NewNullAuthHandler(fs), 1024)}
-	if configure != nil {
-		configure(srv)
-	}
-	go func() {
-		_ = srv.Serve(listener)
-	}()
-
-	c, err := rpc.DialTCP(listener.Addr().Network(), listener.Addr().(*net.TCPAddr).String(), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var mounter nfsc.Mount
-	mounter.Client = c
-	target, err := mounter.Mount("/", rpc.AuthNull)
-	if err != nil {
-		c.Close()
-		t.Fatal(err)
-	}
-	return target, func() {
-		_ = mounter.Unmount()
-		c.Close()
-		_ = listener.Close()
-	}
-}
 
 // blockingFS holds every Lstat of one name until the test releases it, which
 // is how a slow filesystem operation is modelled without a slow filesystem.
@@ -117,7 +81,7 @@ func TestSlowRequestDoesNotBlockTheConnection(t *testing.T) {
 		release:    make(chan struct{}),
 	}
 
-	target, cleanup := startMemNFSWithServer(t, fs, nil)
+	target, cleanup := startMemNFS(t, fs)
 	defer cleanup()
 
 	_, rootFH, err := target.Lookup("/")
@@ -188,9 +152,7 @@ func TestConcurrencyIsBounded(t *testing.T) {
 	}
 
 	const bound = 2
-	target, cleanup := startMemNFSWithServer(t, fs, func(s *nfs.Server) {
-		s.MaxConcurrentRequests = bound
-	})
+	target, cleanup := startMemNFSBounded(t, fs, bound)
 	defer cleanup()
 
 	_, rootFH, err := target.Lookup("/")
@@ -217,15 +179,24 @@ func TestConcurrencyIsBounded(t *testing.T) {
 		}()
 	}
 
-	// The bound must hold for as long as the requests keep arriving.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if got := fs.blocked.Load(); got > bound {
+	// Wait for the bound to saturate, then hold: the extra request must still
+	// not be inside the filesystem once it has had every chance to arrive.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := fs.blocked.Load()
+		if got > bound {
 			t.Fatalf("%d requests were inside the filesystem at once, want at most %d", got, bound)
+		}
+		if got == bound {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d requests reached the filesystem, want the bound %d to be saturated", got, bound)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	time.Sleep(500 * time.Millisecond)
 	if got := fs.blocked.Load(); got != bound {
-		t.Fatalf("%d requests were inside the filesystem, want the bound %d to be saturated", got, bound)
+		t.Fatalf("%d requests were inside the filesystem at once, want the bound %d to hold", got, bound)
 	}
 }

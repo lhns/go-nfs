@@ -90,7 +90,7 @@ func (c *conn) serve(ctx context.Context) {
 		if !w.buffered {
 			// Arguments too large to buffer are still a reader over the
 			// connection, so this must run before anything else reads it.
-			ok := c.dispatch(connCtx, cancel, w)
+			ok := c.dispatch(connCtx, w)
 			<-sem
 			if !ok {
 				return
@@ -102,7 +102,11 @@ func (c *conn) serve(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			c.dispatch(connCtx, cancel, w)
+			if !c.dispatch(connCtx, w) {
+				// Release anything parked in finish(). The read at the top of
+				// the loop then fails on the closed connection and serve ends.
+				cancel()
+			}
 		}()
 	}
 }
@@ -110,29 +114,25 @@ func (c *conn) serve(ctx context.Context) {
 // dispatch handles one request and queues its reply, reporting whether the
 // connection may carry more.
 //
-// A failure ends the connection under whatever else is in flight. That is what
-// a serial server did too, since a handler or response error closed the
-// connection and dropped every request queued behind it; the only difference
-// is that the dropped requests have now already started. Their replies are
-// never written, so the client sees them time out and retries them on the next
-// connection, exactly as it would have.
-func (c *conn) dispatch(ctx context.Context, cancel context.CancelFunc, w *response) bool {
-	err := c.handle(ctx, w)
-	respErr := w.finish(ctx)
-	if err != nil {
-		Log.Errorf("error handling req: %v", err)
-		// failure to handle at a level needing to close the connection.
-		c.Close()
-		cancel()
-		return false
+// A failure ends the connection under whatever else is in flight, which is what
+// a serial server did too: it dropped every request queued behind the failing
+// one. Their replies are never written, so the client retries them on the next
+// connection.
+func (c *conn) dispatch(ctx context.Context, w *response) bool {
+	// finish runs even when handle failed, so a partially written reply is
+	// queued exactly as it was before requests were dispatched concurrently.
+	handleErr := c.handle(ctx, w)
+	finishErr := w.finish(ctx)
+	if handleErr == nil && finishErr == nil {
+		return true
 	}
-	if respErr != nil {
-		Log.Errorf("error sending response: %v", respErr)
-		c.Close()
-		cancel()
-		return false
+	if handleErr != nil {
+		Log.Errorf("error handling req: %v", handleErr)
+	} else {
+		Log.Errorf("error sending response: %v", finishErr)
 	}
-	return true
+	c.Close()
+	return false
 }
 
 func (c *conn) serializeWrites(ctx context.Context) {
@@ -356,16 +356,16 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, ErrInputInvalid
 	}
 
-	// The body is read in full before the handler sees it. Handlers parse
-	// their arguments lazily out of req.Body, so a body left as a reader over
-	// the connection can only be handled while nothing else reads that
-	// connection, which is what made a connection serial.
+	// The body is read in full so it reads from memory rather than from the
+	// connection. Handlers parse their arguments lazily out of req.Body, so a
+	// body left on the connection can only be handled while nothing else reads
+	// that connection, which is what made a connection serial.
 	//
-	// FSINFO advertises a 1 GiB wtmax and a client may take it, so the cap is
-	// what keeps memory held by in-flight requests at maxConcurrentRequests
-	// times maxBufferedRequestBytes rather than times wtmax. A request over
-	// the cap keeps the old streaming body and is handled inline; Linux
-	// negotiates a wsize of at most 1 MiB, so this is the exotic case.
+	// reqLen is the client's own number and FSINFO advertises a 1 GiB wtmax, so
+	// buffering unconditionally would let one frame header allocate that much,
+	// times the worker bound. Over the cap the body stays a reader over the
+	// connection and is handled inline; Linux negotiates a wsize of at most
+	// 1 MiB, so that is the exotic case.
 	var body io.Reader = reader
 	buffered := reqLen <= maxBufferedRequestBytes
 	if buffered {
