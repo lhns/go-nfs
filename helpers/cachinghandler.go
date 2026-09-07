@@ -87,19 +87,33 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 	}
 
 	if f, ok := c.activeHandles.Get(id); ok {
-		for _, k := range c.activeHandles.Keys() {
-			candidate, _ := c.activeHandles.Peek(k)
-			if hasPrefix(f.p, candidate.p) {
-				_, _ = c.activeHandles.Get(k)
-			}
-		}
-		if ok {
-			newP := make([]string, len(f.p))
-			copy(newP, f.p)
-			return f.f, newP, nil
-		}
+		c.refreshAncestors(f)
+
+		newP := make([]string, len(f.p))
+		copy(newP, f.p)
+		return f.f, newP, nil
 	}
 	return nil, []string{}, &nfs.NFSStatusError{NFSStatus: nfs.NFSStatusStale}
+}
+
+// refreshAncestors marks every ancestor of a path as recently used, so a
+// parent is not evicted while a handle below it is still live. An evicted
+// ancestor surfaces as ESTALE on a path the client is still using.
+//
+// The ancestors are reached through the reverse index rather than by scanning
+// the cache. This runs on EVERY request, and the cache is sized for a source
+// tree (remote-docker allows a million handles), so a scan makes the cost of
+// resolving one handle grow with the number of files the client has ever
+// touched: measured there at 12us per resolution with 100 handles cached and
+// 10.3ms with 50,000, linear in the cache size. That is 1.9 seconds of pure
+// cache walking for one 256MB write, which is enough to push the RPCs queued
+// behind it past a soft mount's timeout and turn the write into EIO.
+func (c *CachingHandler) refreshAncestors(f entry) {
+	for i := len(f.p) - 1; i >= 0; i-- {
+		for _, id := range c.getReverseHandles(f.f.Join(f.p[:i]...)) {
+			_, _ = c.activeHandles.Get(id)
+		}
+	}
 }
 
 func (c *CachingHandler) searchReverseCache(f billy.Filesystem, path string) []byte {
@@ -216,18 +230,6 @@ func (c *CachingHandler) InvalidateHandle(fs billy.Filesystem, handle []byte) er
 // HandleLimit exports how many file handles can be safely stored by this cache.
 func (c *CachingHandler) HandleLimit() int {
 	return c.cacheLimit
-}
-
-func hasPrefix(path, prefix []string) bool {
-	if len(prefix) > len(path) {
-		return false
-	}
-	for i, e := range prefix {
-		if path[i] != e {
-			return false
-		}
-	}
-	return true
 }
 
 type verifier struct {
