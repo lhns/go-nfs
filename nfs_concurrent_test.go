@@ -39,6 +39,28 @@ func (b *blockingFS) Lstat(p string) (os.FileInfo, error) {
 	return b.Filesystem.Lstat(p)
 }
 
+// newBlockingFS holds every Lstat of blockOn until the returned release runs.
+// others are ordinary files in the same filesystem.
+func newBlockingFS(t *testing.T, blockOn string, others ...string) (*blockingFS, func()) {
+	t.Helper()
+	mem := memfs.New()
+	for _, name := range append([]string{blockOn}, others...) {
+		f, err := mem.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+	}
+	fs := &blockingFS{
+		Filesystem: mem,
+		name:       blockOn,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	var once sync.Once
+	return fs, func() { once.Do(func() { close(fs.release) }) }
+}
+
 // lookupRaw issues one LOOKUP and returns its NFS status word. One RPC, so a
 // timing assertion measures the server rather than a client-side walk.
 func lookupRaw(target *nfsc.Target, dirFH []byte, name string) (uint32, error) {
@@ -66,20 +88,7 @@ func lookupRaw(target *nfsc.Target, dirFH []byte, name string) (uint32, error) {
 // Fails against a serial server: the second LOOKUP is not read off the socket
 // at all until the first has returned.
 func TestSlowRequestDoesNotBlockTheConnection(t *testing.T) {
-	mem := memfs.New()
-	for _, name := range []string{"slow", "quick"} {
-		f, err := mem.Create(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = f.Close()
-	}
-	fs := &blockingFS{
-		Filesystem: mem,
-		name:       "slow",
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
+	fs, release := newBlockingFS(t, "slow", "quick")
 
 	target, cleanup := startMemNFS(t, fs)
 	defer cleanup()
@@ -88,9 +97,6 @@ func TestSlowRequestDoesNotBlockTheConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("looking up the root: %v", err)
 	}
-
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(fs.release) }) }
 	defer release()
 
 	slowDone := make(chan error, 1)
@@ -137,19 +143,7 @@ func TestSlowRequestDoesNotBlockTheConnection(t *testing.T) {
 // up to wsize of buffered payload, per request in flight. With the bound at N,
 // the N+1th request waits.
 func TestConcurrencyIsBounded(t *testing.T) {
-	mem := memfs.New()
-	f, err := mem.Create("slow")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = f.Close()
-
-	fs := &blockingFS{
-		Filesystem: mem,
-		name:       "slow",
-		entered:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
+	fs, release := newBlockingFS(t, "slow")
 
 	const bound = 2
 	target, cleanup := startMemNFSBounded(t, fs, bound)
@@ -160,13 +154,11 @@ func TestConcurrencyIsBounded(t *testing.T) {
 		t.Fatalf("looking up the root: %v", err)
 	}
 
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(fs.release) }) }
-	// The in-flight lookups must finish before cleanup closes the client.
-	// go-nfs-client's Client.Close closes the channel its own receive
-	// goroutine delivers replies on, so closing it with a call outstanding is
-	// a close/send race inside that library. Deferred before release so the
-	// order on the way out is release, wait, cleanup.
+	// The in-flight lookups must finish before cleanup closes the client:
+	// go-nfs-client's Client.Close closes the channel its own receive goroutine
+	// delivers replies on, so closing it with a call outstanding is a close/send
+	// race inside that library. Deferred before release so the order on the way
+	// out is release, wait, cleanup.
 	var inflight sync.WaitGroup
 	defer inflight.Wait()
 	defer release()

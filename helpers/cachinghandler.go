@@ -40,8 +40,11 @@ func NewCachingHandlerWithVerifierLimit(h nfs.Handler, limit int, verifierLimit 
 // CachingHandler implements to/from handle via an LRU cache.
 type CachingHandler struct {
 	nfs.Handler
-	activeHandles    *lru.Cache[uuid.UUID, entry]
-	reverseHandles   map[string][]uuid.UUID
+	activeHandles  *lru.Cache[uuid.UUID, entry]
+	reverseHandles map[string][]uuid.UUID
+	// reverseHandlesMu guards reverseHandles. activeHandles has a lock of its
+	// own and never reaches back here, so it may be taken under this one; the
+	// reverse order is never safe.
 	reverseHandlesMu sync.RWMutex
 	activeVerifiers  *lru.Cache[uint64, verifier]
 	cacheLimit       int
@@ -119,8 +122,7 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 //
 // The index is read under its own lock rather than through a snapshot:
 // evictReverseCacheLocked shifts a key's slice IN PLACE, so a range over one
-// handed out earlier races it. Taking the LRU's lock under this one is the
-// order ToHandle and Rename already use, and the LRU never reaches back.
+// handed out earlier races it.
 func (c *CachingHandler) refreshAncestors(f entry) {
 	c.reverseHandlesMu.RLock()
 	defer c.reverseHandlesMu.RUnlock()
@@ -132,8 +134,7 @@ func (c *CachingHandler) refreshAncestors(f entry) {
 	}
 }
 
-// searchReverseCacheLocked requires reverseHandlesMu. The LRU has a lock of
-// its own and never reaches back into this one, so taking it here is safe.
+// searchReverseCacheLocked requires reverseHandlesMu.
 func (c *CachingHandler) searchReverseCacheLocked(f billy.Filesystem, path string) []byte {
 	uuids := c.reverseHandles[path]
 
