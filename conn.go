@@ -16,8 +16,8 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
-// maxBufferedRequestBytes is the largest request read into memory before it is
-// dispatched to a worker. See readRequestHeader.
+// maxBufferedRequestBytes bounds a request read into memory rather than left on
+// the connection. See readRequestHeader.
 const maxBufferedRequestBytes = 2 << 20
 
 var (
@@ -62,9 +62,16 @@ func (c *conn) serve(ctx context.Context) {
 		// serializeWrites has stopped draining.
 		cancel()
 		wg.Wait()
+		c.Close()
 	}()
 	c.writeSerializer = make(chan []byte, 1)
-	go c.serializeWrites(connCtx)
+	// A failed write ends serializeWrites and nothing else drains the queue, so
+	// without the cancel every worker parks in finish() and serve blocks behind
+	// the worker bound with no reader left to notice the connection is gone.
+	go func() {
+		defer cancel()
+		c.serializeWrites(connCtx)
+	}()
 
 	sem := make(chan struct{}, c.Server.maxConcurrentRequests())
 
@@ -72,32 +79,24 @@ func (c *conn) serve(ctx context.Context) {
 	for {
 		w, err := c.readRequestHeader(connCtx, bio)
 		if err != nil {
-			if err == io.EOF {
-				// Clean close.
-				c.Close()
-				return
-			}
 			return
 		}
 		Log.Tracef("request: %v", w.req)
+
+		if !w.buffered {
+			// Arguments too large to buffer are still a reader over the
+			// connection, so this must run before anything else reads it.
+			if !c.dispatch(connCtx, w) {
+				return
+			}
+			continue
+		}
 
 		select {
 		case sem <- struct{}{}:
 		case <-connCtx.Done():
 			return
 		}
-
-		if !w.buffered {
-			// Arguments too large to buffer are still a reader over the
-			// connection, so this must run before anything else reads it.
-			ok := c.dispatch(connCtx, w)
-			<-sem
-			if !ok {
-				return
-			}
-			continue
-		}
-
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -361,11 +360,11 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	// body left on the connection can only be handled while nothing else reads
 	// that connection, which is what made a connection serial.
 	//
-	// reqLen is the client's own number and FSINFO advertises a 1 GiB wtmax, so
-	// buffering unconditionally would let one frame header allocate that much,
-	// times the worker bound. Over the cap the body stays a reader over the
-	// connection and is handled inline; Linux negotiates a wsize of at most
-	// 1 MiB, so that is the exotic case.
+	// reqLen is untrusted and FSINFO advertises a 1 GiB wtmax, so buffering
+	// unconditionally is a remote memory lever: one frame header, that much
+	// allocated, times the worker bound. Over the cap the body stays a reader
+	// over the connection and serve handles it inline. Linux negotiates a wsize
+	// of at most 1 MiB, so that is the exotic case.
 	var body io.Reader = reader
 	buffered := reqLen <= maxBufferedRequestBytes
 	if buffered {
