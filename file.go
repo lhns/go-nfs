@@ -255,12 +255,24 @@ func (s *SetFileAttributes) Apply(changer billy.Change, fs billy.Filesystem, fil
 		} else if err != nil {
 			return err
 		}
+		// Closed on every path out of here, as in onWrite: a size that is
+		// refused and a truncate that fails both used to return with the file
+		// open, and a filesystem holding descriptors between requests cannot
+		// tell that the request is over.
+		closed := false
+		defer func() {
+			if !closed {
+				_ = fp.Close()
+			}
+		}()
+
 		if *s.SetSize > math.MaxInt64 {
 			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
 		}
 		if err := fp.Truncate(int64(*s.SetSize)); err != nil {
 			return err
 		}
+		closed = true
 		if err := fp.Close(); err != nil {
 			return err
 		}
