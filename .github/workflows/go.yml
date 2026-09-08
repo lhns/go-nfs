@@ -2,9 +2,9 @@ name: Go
 
 on:
   push:
-    branches: [ master, lhns-fixes ]
+    branches: [ master, lhns-fixes, ci-race-891a623 ]
   pull_request:
-    branches: [ master, lhns-fixes ]
+    branches: [ master, lhns-fixes, ci-race-891a623 ]
 
 permissions:
   contents: read
