@@ -68,6 +68,17 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
+	// Closed on every path out of here, not only the one that succeeds. A
+	// filesystem that keeps a descriptor open between requests -- the caller's
+	// business, not this package's -- has no other way to learn the request is
+	// over, so a return without this pins the file for the life of the process.
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
+
 	if req.Offset > 0 {
 		if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
 			return &NFSStatusError{NFSStatusIO, err}
@@ -82,6 +93,10 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		Log.Errorf("Error writing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
 	}
+	// Explicitly here rather than left to the defer: a close that fails after
+	// a write that succeeded is the client's business, and it decides the
+	// reply's status.
+	closed = true
 	if err := file.Close(); err != nil {
 		Log.Errorf("error closing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
